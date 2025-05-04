@@ -56,7 +56,7 @@ combine_disks() {
 
     echo "/dev/$VG_NAME/$LV_NAME $MOUNT_POINT ext4 defaults 0 0" >> /etc/fstab
 
-    echo "✅ LVM combined and mounted at $MOUNT_POINT"
+    echo " LVM combined and mounted at $MOUNT_POINT"
 }
 
 separate_disks() {
