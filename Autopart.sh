@@ -24,7 +24,7 @@ select_disks() {
         if [[ "$index" =~ ^[0-9]+$ ]] && (( index >= 1 && index <= ${#DISKS[@]} )); then
             SELECTED_DISKS+=("${DISKS[$((index - 1))]}")
         else
-            echo "❌ Invalid selection: $index"
+            echo " Invalid selection: $index"
             exit 1
         fi
     done
@@ -38,19 +38,19 @@ combine_disks() {
         sgdisk --zap-all "$disk"
     done
 
-    echo "🧱 Creating physical volumes..."
+    echo " Creating physical volumes..."
     pvcreate "${SELECTED_DISKS[@]}"
 
-    echo "🔗 Creating volume group '$VG_NAME'..."
+    echo " Creating volume group '$VG_NAME'..."
     vgcreate "$VG_NAME" "${SELECTED_DISKS[@]}"
 
-    echo "📦 Creating logical volume '$LV_NAME'..."
+    echo " Creating logical volume '$LV_NAME'..."
     lvcreate -l 100%FREE -n "$LV_NAME" "$VG_NAME"
 
-    echo "🧾 Formatting logical volume..."
+    echo " Formatting logical volume..."
     mkfs.ext4 "/dev/$VG_NAME/$LV_NAME"
 
-    echo "📁 Mounting to $MOUNT_POINT..."
+    echo " Mounting to $MOUNT_POINT..."
     mkdir -p "$MOUNT_POINT"
     mount "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
 
@@ -60,7 +60,7 @@ combine_disks() {
 }
 
 separate_disks() {
-    echo "⚠️ This will destroy the LVM volume and all data."
+    echo " This will destroy the LVM volume and all data."
 
     read -rp "Type 'yes' to continue: " confirm
     if [[ "$confirm" != "yes" ]]; then
