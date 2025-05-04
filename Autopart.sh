@@ -1,149 +1,102 @@
 #!/bin/bash
 
-set -euo pipefail
-
-MOUNT_BASE="/mnt/disk"
-VG_NAME="vg_combined"
+VG_NAME="vg_dynamic"
 LV_NAME="lv_combined"
+MOUNT_POINT="/mnt/combined"
 
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root." >&2
-    exit 1
-fi
+list_disks() {
+    echo "Available disks:"
+    lsblk -d -o NAME,SIZE,MODEL,TYPE | grep -w disk | nl
+}
 
-echo "Available Disks:"
-DISKS=()
-for DISK in $(lsblk -dno NAME | grep -E 'sd|nvme|vd'); do
-    echo "[${#DISKS[@]}] /dev/$DISK"
-    DISKS+=("/dev/$DISK")
-done
+get_disk_paths() {
+    lsblk -d -o NAME,TYPE | grep -w disk | awk '{print "/dev/" $1}'
+}
 
-if [ ${#DISKS[@]} -eq 0 ]; then
-    echo "No disks found. Exiting."
-    exit 1
-fi
+select_disks() {
+    mapfile -t DISKS < <(get_disk_paths)
 
-echo ""
-read -p "Enter the indexes of disks to use (e.g., 0 1): " -a SELECTED_INDEXES
+    echo "Enter the disk numbers to combine (e.g., 1 2 4):"
+    read -rp "> " SELECTION
 
-# Validate indexes
-for i in "${SELECTED_INDEXES[@]}"; do
-    if ! [[ "$i" =~ ^[0-9]+$ ]] || [ "$i" -ge "${#DISKS[@]}" ]; then
-        echo "Invalid index: $i"
-        exit 1
-    fi
-done
-
-SELECTED_DISKS=()
-for i in "${SELECTED_INDEXES[@]}"; do
-    SELECTED_DISKS+=("${DISKS[$i]}")
-done
-
-echo ""
-echo "Choose an operation:"
-echo "1) Combine existing partitions on selected disks using LVM"
-echo "2) Delete all partitions on selected disks, repartition, and format"
-read -p "Enter choice [1/2]: " CHOICE
-
-if [[ "$CHOICE" == "1" ]]; then
-    echo "Combining existing partitions using LVM..."
-    PARTITIONS=()
-    for d in "${SELECTED_DISKS[@]}"; do
-        # Find all partitions (e.g., /dev/sda1, /dev/sda2, /dev/nvme0n1p1, etc.)
-        for part in $(lsblk -ln -o NAME "/dev/$(basename $d)" | grep -v "^$(basename $d)$"); do
-            PART="/dev/$part"
-            echo "  Adding $PART to LVM"
-            pvcreate -y $PART
-            PARTITIONS+=("$PART")
-        done
+    SELECTED_DISKS=()
+    for index in $SELECTION; do
+        if [[ "$index" =~ ^[0-9]+$ ]] && (( index >= 1 && index <= ${#DISKS[@]} )); then
+            SELECTED_DISKS+=("${DISKS[$((index - 1))]}")
+        else
+            echo "❌ Invalid selection: $index"
+            exit 1
+        fi
     done
-    if [ ${#PARTITIONS[@]} -eq 0 ]; then
-        echo "No partitions found on selected disks!"
-        exit 1
-    fi
-    vgcreate $VG_NAME "${PARTITIONS[@]}"
-    lvcreate -l 100%FREE -n $LV_NAME $VG_NAME
-    mkfs.ext4 /dev/$VG_NAME/$LV_NAME
+}
 
-    mkdir -p $MOUNT_BASE
-    mount /dev/$VG_NAME/$LV_NAME $MOUNT_BASE
+combine_disks() {
+    echo "🧹 Wiping selected disks..."
+    for disk in "${SELECTED_DISKS[@]}"; do
+        umount "${disk}1" 2>/dev/null || true
+        wipefs -a "$disk"
+        sgdisk --zap-all "$disk"
+    done
 
-    UUID=$(blkid -s UUID -o value /dev/$VG_NAME/$LV_NAME)
-    if ! grep -q "$UUID" /etc/fstab; then
-        echo "UUID=$UUID $MOUNT_BASE ext4 defaults 0 0" >> /etc/fstab
-    fi
-    echo "Combined volume mounted at $MOUNT_BASE"
+    echo "🧱 Creating physical volumes..."
+    pvcreate "${SELECTED_DISKS[@]}"
 
-elif [[ "$CHOICE" == "2" ]]; then
-    echo "WARNING: This will delete ALL partitions on the selected disks!"
-    read -p "Are you sure you want to continue? [y/N]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "🔗 Creating volume group '$VG_NAME'..."
+    vgcreate "$VG_NAME" "${SELECTED_DISKS[@]}"
+
+    echo "📦 Creating logical volume '$LV_NAME'..."
+    lvcreate -l 100%FREE -n "$LV_NAME" "$VG_NAME"
+
+    echo "🧾 Formatting logical volume..."
+    mkfs.ext4 "/dev/$VG_NAME/$LV_NAME"
+
+    echo "📁 Mounting to $MOUNT_POINT..."
+    mkdir -p "$MOUNT_POINT"
+    mount "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
+
+    echo "/dev/$VG_NAME/$LV_NAME $MOUNT_POINT ext4 defaults 0 0" >> /etc/fstab
+
+    echo "✅ LVM combined and mounted at $MOUNT_POINT"
+}
+
+separate_disks() {
+    echo "⚠️ This will destroy the LVM volume and all data."
+
+    read -rp "Type 'yes' to continue: " confirm
+    if [[ "$confirm" != "yes" ]]; then
         echo "Aborted."
         exit 0
     fi
 
-    read -p "Do you want to combine the new partitions using LVM? [y/N]: " COMBINE
-    if [[ "$COMBINE" =~ ^[Yy]$ ]]; then
-        echo "Repartitioning and combining disks using LVM..."
-        PARTITIONS=()
-        for d in "${SELECTED_DISKS[@]}"; do
-            echo "  Wiping $d"
-            wipefs -a $d &>/dev/null
-            sgdisk --zap-all $d &>/dev/null
-            sgdisk -o $d &>/dev/null
-            sgdisk -n 1:0:0 $d &>/dev/null
-            sleep 2
-            if [[ $d =~ nvme ]]; then
-                PART="${d}p1"
-            else
-                PART="${d}1"
-            fi
-            wipefs -a $PART &>/dev/null
-            pvcreate -y $PART
-            PARTITIONS+=("$PART")
-        done
-        vgcreate $VG_NAME "${PARTITIONS[@]}"
-        lvcreate -l 100%FREE -n $LV_NAME $VG_NAME
-        mkfs.ext4 /dev/$VG_NAME/$LV_NAME
+    umount "$MOUNT_POINT" 2>/dev/null || true
+    sed -i "\|/dev/$VG_NAME/$LV_NAME|d" /etc/fstab
 
-        mkdir -p $MOUNT_BASE
-        mount /dev/$VG_NAME/$LV_NAME $MOUNT_BASE
+    lvremove -y "/dev/$VG_NAME/$LV_NAME"
+    vgremove -y "$VG_NAME"
 
-        UUID=$(blkid -s UUID -o value /dev/$VG_NAME/$LV_NAME)
-        if ! grep -q "$UUID" /etc/fstab; then
-            echo "UUID=$UUID $MOUNT_BASE ext4 defaults 0 0" >> /etc/fstab
-        fi
-        echo "Combined volume mounted at $MOUNT_BASE"
-    else
-        echo "Repartitioning and formatting disks individually..."
-        i=1
-        for d in "${SELECTED_DISKS[@]}"; do
-            echo "  Wiping $d"
-            wipefs -a $d &>/dev/null
-            sgdisk --zap-all $d &>/dev/null
-            sgdisk -o $d &>/dev/null
-            sgdisk -n 1:0:0 $d &>/dev/null
-            sleep 2
-            if [[ $d =~ nvme ]]; then
-                PART="${d}p1"
-            else
-                PART="${d}1"
-            fi
-            mkfs.ext4 -q $PART
-            MOUNT_POINT="${MOUNT_BASE}${i}"
-            mkdir -p $MOUNT_POINT
-            mount $PART $MOUNT_POINT
-            UUID=$(blkid -s UUID -o value $PART)
-            if ! grep -q "$UUID" /etc/fstab; then
-                echo "UUID=$UUID $MOUNT_POINT ext4 defaults 0 0" >> /etc/fstab
-            fi
-            echo "$PART mounted at $MOUNT_POINT"
-            ((i++))
-        done
-    fi
-else
-    echo "Invalid choice."
-    exit 1
-fi
+    PHYSICAL_DISKS=$(pvs --noheadings -o pv_name)
 
-echo "Done!"
+    for disk in $PHYSICAL_DISKS; do
+        pvremove -y "$disk"
+        wipefs -a "$disk"
+        parted -s "$disk" mklabel gpt mkpart primary ext4 0% 100%
+        mkfs.ext4 "${disk}1"
+        echo "Disk $disk reset and formatted as ext4"
+    done
+}
+
+# --- MAIN ---
+
+case "$1" in
+    combine)
+        list_disks
+        select_disks
+        combine_disks
+        ;;
+    separate)
+        separate_disks
+        ;;
+    *)
+        echo "Usage: $0 {combine|separate}"
+        ;;
+esac
