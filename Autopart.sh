@@ -31,7 +31,7 @@ select_disks() {
 }
 
 combine_disks() {
-    echo "🧹 Wiping selected disks..."
+    echo "Wiping selected disks..."
     for disk in "${SELECTED_DISKS[@]}"; do
         umount "${disk}1" 2>/dev/null || true
         wipefs -a "$disk"
